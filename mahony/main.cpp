@@ -12,7 +12,6 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/select.h>
-
 #include "mahony.h"
 
 static std::atomic<bool> g_running(true);
@@ -74,6 +73,12 @@ struct G354Data {
 struct Vec2 {
     float x = 0.0f;
     float y = 0.0f;
+};
+
+struct Vec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
 };
 
 static void onSignal(int) {
@@ -218,6 +223,80 @@ static int32_t i32FromBE(const uint8_t* data, int start) {
 
     return static_cast<int32_t>(u);
 }
+
+static uint16_t u16FromBE(const uint8_t* data, int start) {
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(data[start]) << 8) |
+        static_cast<uint16_t>(data[start + 1])
+    );
+}
+
+static uint16_t calcG354Checksum(const uint8_t frame[G354_FRAME_LEN]) {
+    // Checksum range: after AD=0x80 and before checksum/delimiter.
+    // Current fixed packet: frame[1..34] = FLAG, TEMP, GYRO, ACCEL, GPIO, COUNT.
+    uint32_t sum = 0;
+    for (int i = 1; i <= 34; i += 2) {
+        sum += u16FromBE(frame, i);
+    }
+    return static_cast<uint16_t>(sum & 0xFFFFu);
+}
+
+static bool hasValidG354Checksum(const uint8_t frame[G354_FRAME_LEN]) {
+    const uint16_t expected = calcG354Checksum(frame);
+    const uint16_t received = u16FromBE(frame, 35);
+    return expected == received;
+}
+
+static uint16_t extractG354Count(const uint8_t frame[G354_FRAME_LEN]) {
+    // Fixed packet: COUNT is frame[33..34].
+    return u16FromBE(frame, 33);
+}
+
+class G354FrameValidator {
+public:
+    bool accept(const uint8_t frame[G354_FRAME_LEN]) {
+        if (frame[0] != 0x80 || frame[G354_FRAME_LEN - 1] != 0x0D) {
+            badHeader_++;
+            return false;
+        }
+
+        if (!hasValidG354Checksum(frame)) {
+            badChecksum_++;
+            return false;
+        }
+
+        const uint16_t count = extractG354Count(frame);
+        if (hasLastCount_) {
+            const uint16_t delta = static_cast<uint16_t>(count - lastCount_);
+
+            // Epson COUNT is a sampling counter, not necessarily +1 per host read.
+            // At 100Hz readout it is usually around 20 counts/sample. Here只过滤重复帧和明显断裂。
+            if (delta == 0 || delta > MAX_REASONABLE_COUNT_DELTA) {
+                badCount_++;
+                lastCount_ = count;
+                return false;
+            }
+        }
+
+        lastCount_ = count;
+        hasLastCount_ = true;
+        return true;
+    }
+
+    int badHeader() const { return badHeader_; }
+    int badChecksum() const { return badChecksum_; }
+    int badCount() const { return badCount_; }
+
+private:
+    static constexpr uint16_t MAX_REASONABLE_COUNT_DELTA = 200;
+
+    bool hasLastCount_ = false;
+    uint16_t lastCount_ = 0;
+
+    int badHeader_ = 0;
+    int badChecksum_ = 0;
+    int badCount_ = 0;
+};
 
 static G354Data parseG354Frame(const uint8_t frame[G354_FRAME_LEN]) {
     G354Data imu {};
@@ -419,6 +498,10 @@ static G354Data calibrateGyroBias(SerialPort& ser, int samples) {
             continue;
         }
 
+        if (!hasValidG354Checksum(frame)) {
+            continue;
+        }
+
         G354Data imu = parseG354Frame(frame);
 
         sumGx += imu.gx;
@@ -456,9 +539,9 @@ static G354Data calibrateGyroBias(SerialPort& ser, int samples) {
 class PlanarPathIntegrator {
 public:
     void update(
-        float linAxMg,
-        float linAyMg,
-        float yawDeg,
+        float linAxWorldMg,
+        float linAyWorldMg,
+        float linAzWorldMg,
         float gxDps,
         float gyDps,
         float gzDps,
@@ -471,20 +554,23 @@ public:
             return;
         }
 
-        float accNormMg = vec3Norm(axRawMg, ayRawMg, azRawMg);
-        float gyroNorm = vec3Norm(gxDps, gyDps, gzDps);
-        float linNormMg = std::sqrt(linAxMg * linAxMg + linAyMg * linAyMg);
+        const float accNormMg = vec3Norm(axRawMg, ayRawMg, azRawMg);
+        const float gyroNorm = vec3Norm(gxDps, gyDps, gzDps);
+        const float linNormMg = vec3Norm(linAxWorldMg, linAyWorldMg, linAzWorldMg);
 
-        bool stationary =
+        const bool stationary =
             gyroNorm < STATIONARY_GYRO_DPS &&
             std::fabs(accNormMg - 1000.0f) < STATIONARY_ACC_NORM_ERR_MG &&
             linNormMg < STATIONARY_LIN_ACC_XY_MG;
 
         if (stationary) {
             stationaryCount_++;
+
+            // 这里的 bias 已经在世界系，不能再用 yaw 二次旋转。
             const float alpha = 0.01f;
-            accBiasMg_.x = (1.0f - alpha) * accBiasMg_.x + alpha * linAxMg;
-            accBiasMg_.y = (1.0f - alpha) * accBiasMg_.y + alpha * linAyMg;
+            accBiasWorldMg_.x = (1.0f - alpha) * accBiasWorldMg_.x + alpha * linAxWorldMg;
+            accBiasWorldMg_.y = (1.0f - alpha) * accBiasWorldMg_.y + alpha * linAyWorldMg;
+            accBiasWorldMg_.z = (1.0f - alpha) * accBiasWorldMg_.z + alpha * linAzWorldMg;
 
             if (stationaryCount_ >= STATIONARY_CONFIRM_COUNT) {
                 vel_.x = 0.0f;
@@ -498,26 +584,21 @@ public:
         stationaryCount_ = 0;
         lastStationary_ = false;
 
-        float axBodyMps2 = (linAxMg - accBiasMg_.x) * G0 / 1000.0f;
-        float ayBodyMps2 = (linAyMg - accBiasMg_.y) * G0 / 1000.0f;
-        float yawRad = yawDeg * 0.0174532925f;
-        float c = std::cos(yawRad);
-        float s = std::sin(yawRad);
+        const float axWorldMps2 = (linAxWorldMg - accBiasWorldMg_.x) * G0 / 1000.0f;
+        const float ayWorldMps2 = (linAyWorldMg - accBiasWorldMg_.y) * G0 / 1000.0f;
 
-        float axWorld = c * axBodyMps2 - s * ayBodyMps2;
-        float ayWorld = s * axBodyMps2 + c * ayBodyMps2;
+        const Vec2 oldPos = pos_;
 
-        Vec2 oldPos = pos_;
+        pos_.x += vel_.x * dt + 0.5f * axWorldMps2 * dt * dt;
+        pos_.y += vel_.y * dt + 0.5f * ayWorldMps2 * dt * dt;
 
-        pos_.x += vel_.x * dt + 0.5f * axWorld * dt * dt;
-        pos_.y += vel_.y * dt + 0.5f * ayWorld * dt * dt;
+        vel_.x += axWorldMps2 * dt;
+        vel_.y += ayWorldMps2 * dt;
 
-        vel_.x += axWorld * dt;
-        vel_.y += ayWorld * dt;
-
-        float dx = pos_.x - oldPos.x;
-        float dy = pos_.y - oldPos.y;
+        const float dx = pos_.x - oldPos.x;
+        const float dy = pos_.y - oldPos.y;
         pathLength_ += std::sqrt(dx * dx + dy * dy);
+
     }
 
     Vec2 position() const {
@@ -528,8 +609,8 @@ public:
         return vel_;
     }
 
-    Vec2 accelBiasMg() const {
-        return accBiasMg_;
+    Vec3 accelBiasWorldMg() const {
+        return accBiasWorldMg_;
     }
 
     float displacement() const {
@@ -544,10 +625,11 @@ public:
         return lastStationary_;
     }
 
+
 private:
     Vec2 pos_ {};
     Vec2 vel_ {};
-    Vec2 accBiasMg_ {};
+    Vec3 accBiasWorldMg_ {};
 
     float pathLength_ = 0.0f;
 
@@ -595,6 +677,7 @@ int main(int argc, char** argv) {
 
         int frameCount = 0;
         int badFrameCount = 0;
+        G354FrameValidator frameValidator;
 
         while (g_running) {
             auto loopStart = std::chrono::steady_clock::now();
@@ -602,6 +685,11 @@ int main(int argc, char** argv) {
             uint8_t frame[G354_FRAME_LEN];
 
             if (!readG354RawFrame(ser, frame)) {
+                badFrameCount++;
+                continue;
+            }
+
+            if (!frameValidator.accept(frame)) {
                 badFrameCount++;
                 continue;
             }
@@ -625,17 +713,20 @@ int main(int argc, char** argv) {
             float roll, pitch, yaw;
             ahrs.getEuler(roll, pitch, yaw);
 
-            float linAxMg, linAyMg;
-            ahrs.getLinearAccelerationXYMg(imu.ax, imu.ay, linAxMg, linAyMg);
+            float linAxWorldMg, linAyWorldMg, linAzWorldMg;
+            ahrs.getLinearAccelerationWorldMg(
+                imu.ax, imu.ay, imu.az,
+                linAxWorldMg, linAyWorldMg, linAzWorldMg
+            );
 
             float gxCal = imu.gx - gyroBias.gx;
             float gyCal = imu.gy - gyroBias.gy;
             float gzCal = imu.gz - gyroBias.gz;
 
             path.update(
-                linAxMg,
-                linAyMg,
-                yaw,
+                linAxWorldMg,
+                linAyWorldMg,
+                linAzWorldMg,
                 gxCal,
                 gyCal,
                 gzCal,
@@ -650,7 +741,7 @@ int main(int argc, char** argv) {
             if (frameCount % 10 == 0) {
                 Vec2 pos = path.position();
                 Vec2 vel = path.velocity();
-                Vec2 accBias = path.accelBiasMg();
+                Vec3 accBias = path.accelBiasWorldMg();
 
                 float accNormG = vec3Norm(imu.ax, imu.ay, imu.az) / 1000.0f;
 
@@ -663,8 +754,8 @@ int main(int argc, char** argv) {
                     << " | acc[mg]="
                     << imu.ax << "," << imu.ay << "," << imu.az
                     << " norm:" << accNormG << "g"
-                    << " | linXY[mg]="
-                    << linAxMg << "," << linAyMg
+                    << " | linW[mg]="
+                    << linAxWorldMg << "," << linAyWorldMg << "," << linAzWorldMg
                     << " | vel[m/s]="
                     << vel.x << "," << vel.y
                     << " | pos[m]="
@@ -672,10 +763,12 @@ int main(int argc, char** argv) {
                     << " | disp[m]=" << path.displacement()
                     << " path[m]=" << path.pathLength()
                     << " | zupt=" << (path.lastStationary() ? 1 : 0)
-                    << " | accBiasXY[mg]="
-                    << accBias.x << "," << accBias.y
+                    << " | accBiasW[mg]="
+                    << accBias.x << "," << accBias.y << "," << accBias.z
                     << " | dt=" << dt
                     << " | bad=" << badFrameCount
+                    << " | bad_ck=" << frameValidator.badChecksum()
+                    << " | bad_cnt=" << frameValidator.badCount()
                     << std::endl;
             }
 
@@ -692,16 +785,17 @@ int main(int argc, char** argv) {
 
         Vec2 finalPos = path.position();
         Vec2 finalVel = path.velocity();
-
         std::cout << "\n========== FINAL PATH RESULT ==========\n";
         std::cout << "final_x[m](最终估计位置的 X 坐标): " << finalPos.x << "\n";
         std::cout << "final_y[m](最终估计位置的 Y 坐标): " << finalPos.y << "\n";
-        std::cout << "final_velocity_x[m/s](最终x轴速度): " << finalVel.x << "\n";
-        std::cout << "final_velocity_y[m/s](最终y轴速度): " << finalVel.y << "\n";
         std::cout << "final_displacement[m](最终位移): " << path.displacement() << "\n";
         std::cout << "path_length[m](路径长度): " << path.pathLength() << "\n";
+        std::cout << "final_velocity_x[m/s](最终x轴速度): " << finalVel.x << "\n";
+        std::cout << "final_velocity_y[m/s](最终y轴速度): " << finalVel.y << "\n";
         std::cout << "valid_frames(有效帧数): " << frameCount << "\n";
         std::cout << "bad_frames(无效帧数): " << badFrameCount << "\n";
+        std::cout << "bad_checksum_frames(校验和错误帧): " << frameValidator.badChecksum() << "\n";
+        std::cout << "bad_count_frames(计数异常帧): " << frameValidator.badCount() << "\n";
         std::cout << "=======================================\n";
 
     } catch (const std::exception& e) {
