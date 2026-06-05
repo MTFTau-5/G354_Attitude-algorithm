@@ -13,15 +13,11 @@
 #include <unistd.h>
 #include <sys/select.h>
 
-#include "mahony.h"
+#include "attitude_ekf.h"
 
 static std::atomic<bool> g_running(true);
 
 static constexpr int G354_FRAME_LEN = 38;
-
-// Epson G354 UART register map pieces used here.
-// UART write command format: [0x80 | addr, value, 0x0D]
-// UART read command format : [addr, 0x00, 0x0D] -> [addr, high, low, 0x0D]
 static constexpr uint8_t G354_ADDR_WIN_CTRL        = 0x7E;
 static constexpr uint8_t G354_ADDR_MODE_CTRL_HI    = 0x03;
 static constexpr uint8_t G354_ADDR_UART_CTRL_LO    = 0x08;
@@ -32,22 +28,19 @@ static constexpr uint8_t G354_CMD_WINDOW0          = 0x00;
 static constexpr uint8_t G354_CMD_WINDOW1          = 0x01;
 static constexpr uint8_t G354_CMD_BEGIN_SAMPLING   = 0x01;
 static constexpr uint8_t G354_CMD_END_SAMPLING     = 0x02;
-
-// Fixed burst format for the parser below:
-// BURST_CTRL1 = 0xF007: FLAG + TEMP + GYRO + ACCEL + GPIO + COUNT + CHECKSUM
-// BURST_CTRL2 = 0x7000: TEMP/GYRO/ACCEL all output in 32-bit format
 static constexpr uint16_t G354_BURST_CTRL1_FIXED   = 0xF007;
 static constexpr uint16_t G354_BURST_CTRL2_FIXED   = 0x7000;
 
-static constexpr float SF_GYRO = 0.016f;       // (deg/s)/LSB, 16bit scale
-static constexpr float SF_ACC  = 0.2f;         // mG/LSB, 16bit scale
-static constexpr float SCALE_DIV = 65536.0f;   // 32bit high/low combined correction
+static constexpr float SF_GYRO = 0.016f;       
+static constexpr float SF_ACC  = 0.2f;      
+static constexpr float SCALE_DIV = 65536.0f;   
 
-static constexpr float G0 = 9.80665f;
-
-static constexpr float MAHONY_KP = 1.0f;
-static constexpr float MAHONY_KI = 0.005f;
-
+static constexpr float G0 = 9.7970f;  // 太原本地重力加速度
+static constexpr bool CALIBRATE_GYRO_Z = true;
+static constexpr bool USE_YAW_FOR_XY_ROTATION = true;
+static constexpr float ATT_EKF_ACC_NOISE_UNIT = 0.035f;         
+static constexpr float ATT_EKF_GYRO_NOISE_DPS_SQRT_HZ = 0.10f;
+static constexpr float ATT_EKF_BIAS_RW_DPS_SQRT_S = 0.005f; 
 static constexpr int GYRO_CALIB_SAMPLES = 500;
 static constexpr int ACC_INIT_SAMPLES = 200;
 static constexpr int AHRS_WARMUP_SAMPLES = 300;
@@ -467,117 +460,518 @@ static void gravityBodyFromQuaternion(const float q[4], float& gxBody, float& gy
     gzBody = q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3];
 }
 
-class PlanarPathIntegrator {
+class PlanarEKF {
 public:
     void reset() {
-        pos_ = {};
-        vel_ = {};
-        accBiasMg_ = {};
+        for (int i = 0; i < STATE_N; ++i) {
+            x_[i] = 0.0;
+            for (int j = 0; j < STATE_N; ++j) {
+                P_[i][j] = 0.0;
+            }
+        }
+
+        // 状态量：
+        // x[0] = px [m]
+        // x[1] = py [m]
+        // x[2] = vx [m/s]
+        // x[3] = vy [m/s]
+        // x[4] = bax [mg]，XY 线加速度残余零偏
+        // x[5] = bay [mg]
+        P_[0][0] = 1e-4;     // 初始位置不确定度
+        P_[1][1] = 1e-4;
+        P_[2][2] = 1e-2;     // 初始速度不确定度
+        P_[3][3] = 1e-2;
+        P_[4][4] = 200.0;    // bias 初值未知，单位 mg^2
+        P_[5][5] = 200.0;
+
         pathLength_ = 0.0f;
+        rawPathLength_ = 0.0f;
+        pathSpeedLp_ = 0.0;
         stationaryCount_ = 0;
         lastStationary_ = false;
-    }
+            }
 
     void update(
-        float linAxMg,
-        float linAyMg,
+        float fxRawMg,
+        float fyRawMg,
+        float fzRawMg,
+        float gxBody,
+        float gyBody,
         float yawDeg,
         float gxDps,
         float gyDps,
         float gzDps,
-        float axRawMg,
-        float ayRawMg,
-        float azRawMg,
         float dt
     ) {
         if (dt <= 0.0f || dt > DT_MAX) {
             return;
         }
 
-        float accNormMg = vec3Norm(axRawMg, ayRawMg, azRawMg);
-        float gyroNorm = vec3Norm(gxDps, gyDps, gzDps);
-        float linNormMg = std::sqrt(linAxMg * linAxMg + linAyMg * linAyMg);
+        Vec2 oldPos = position();
 
-        bool stationary =
-            gyroNorm < STATIONARY_GYRO_DPS &&
-            std::fabs(accNormMg - 1000.0f) < STATIONARY_ACC_NORM_ERR_MG &&
-            linNormMg < STATIONARY_LIN_ACC_XY_MG;
+        // 加速度计输出是比力 specific force：f = a - g。
+        // 因此真实线加速度 a = f + g。EKF 的控制输入在这里按比力关系生成。
+        float linAxMg = fxRawMg + gxBody * 1000.0f;
+        float linAyMg = fyRawMg + gyBody * 1000.0f;
+
+        bool stationary = detectStationary(
+            linAxMg, linAyMg,
+            gxDps, gyDps, gzDps,
+            fxRawMg, fyRawMg, fzRawMg
+        );
+
+        // 用当前 bias 估计得到预测前的 body/local XY 加速度，用于换向检测。
+        // 注意：这里仍是比力补偿后的线加速度，不直接使用 raw acc。
+        double axBodyBeforePredict = (static_cast<double>(linAxMg) - x_[4]) * MG_TO_MPS2;
+        double ayBodyBeforePredict = (static_cast<double>(linAyMg) - x_[5]) * MG_TO_MPS2;
+
+        predict(linAxMg, linAyMg, yawDeg, dt);
 
         if (stationary) {
             stationaryCount_++;
-            const float alpha = 0.01f;
-            accBiasMg_.x = (1.0f - alpha) * accBiasMg_.x + alpha * linAxMg;
-            accBiasMg_.y = (1.0f - alpha) * accBiasMg_.y + alpha * linAyMg;
+
+            // 静止时速度观测为 0：强 ZUPT。
+            updateVelocityZero();
+
+            // 静止时真实 XY 线加速度应为 0，
+            // 因此 linA ≈ accel_bias，用它观测 bias。
+            updateAccelBias(linAxMg, linAyMg);
 
             if (stationaryCount_ >= STATIONARY_CONFIRM_COUNT) {
-                vel_.x = 0.0f;
-                vel_.y = 0.0f;
+                x_[2] = 0.0;
+                x_[3] = 0.0;
             }
 
             lastStationary_ = true;
-            return;
+        } else {
+            stationaryCount_ = 0;
+            lastStationary_ = false;
+
+            // ZUPT 改回只由“静止检测”触发。
+            // 运动过程中的加速度符号翻转不再触发弱 ZUPT，避免转圈/摆动时被误判为速度归零。
         }
 
-        stationaryCount_ = 0;
-        lastStationary_ = false;
+        symmetrizeP();
 
-        float axBodyMps2 = (linAxMg - accBiasMg_.x) * G0 / 1000.0f;
-        float ayBodyMps2 = (linAyMg - accBiasMg_.y) * G0 / 1000.0f;
+        Vec2 newPos = position();
+        float dx = newPos.x - oldPos.x;
+        float dy = newPos.y - oldPos.y;
 
-        // 6轴 yaw 不是绝对航向，这里只作为相对平面旋转使用。
-        float yawRad = yawDeg * 0.0174532925f;
-        float c = std::cos(yawRad);
-        float s = std::sin(yawRad);
+        // rawPathLength_ 保留原始逐帧位置差累加，只用于调试；它很容易被位置抖动放大。
+        if (!lastStationary_) {
+            rawPathLength_ += std::sqrt(dx * dx + dy * dy);
+        }
 
-        float axWorld = c * axBodyMps2 - s * ayBodyMps2;
-        float ayWorld = s * axBodyMps2 + c * ayBodyMps2;
-
-        Vec2 oldPos = pos_;
-
-        pos_.x += vel_.x * dt + 0.5f * axWorld * dt * dt;
-        pos_.y += vel_.y * dt + 0.5f * ayWorld * dt * dt;
-
-        vel_.x += axWorld * dt;
-        vel_.y += ayWorld * dt;
-
-        float dx = pos_.x - oldPos.x;
-        float dy = pos_.y - oldPos.y;
-        pathLength_ += std::sqrt(dx * dx + dy * dy);
+        // 对外显示的 pathLength_ 改为速度积分 + 门限 + 低通，避免 EKF 位置微抖被累计成很大的路径。
+        // 这对“最后落点准，但总路径巨大”的情况尤其关键。
+        updateGatedPathLength(axBodyBeforePredict, ayBodyBeforePredict, dt);
     }
 
     Vec2 position() const {
-        return pos_;
+        return Vec2{static_cast<float>(x_[0]), static_cast<float>(x_[1])};
     }
 
     Vec2 velocity() const {
-        return vel_;
+        return Vec2{static_cast<float>(x_[2]), static_cast<float>(x_[3])};
     }
 
     Vec2 accelBiasMg() const {
-        return accBiasMg_;
+        return Vec2{static_cast<float>(x_[4]), static_cast<float>(x_[5])};
     }
 
     float displacement() const {
-        return std::sqrt(pos_.x * pos_.x + pos_.y * pos_.y);
+        Vec2 p = position();
+        return std::sqrt(p.x * p.x + p.y * p.y);
     }
 
     float pathLength() const {
         return pathLength_;
     }
 
+    float rawPathLength() const {
+        return rawPathLength_;
+    }
+
     bool lastStationary() const {
         return lastStationary_;
     }
 
+    Vec2 positionStd() const {
+        return Vec2{
+            static_cast<float>(std::sqrt(std::fmax(P_[0][0], 0.0))),
+            static_cast<float>(std::sqrt(std::fmax(P_[1][1], 0.0)))
+        };
+    }
+
+    Vec2 velocityStd() const {
+        return Vec2{
+            static_cast<float>(std::sqrt(std::fmax(P_[2][2], 0.0))),
+            static_cast<float>(std::sqrt(std::fmax(P_[3][3], 0.0)))
+        };
+    }
+
 private:
-    Vec2 pos_ {};
-    Vec2 vel_ {};
-    Vec2 accBiasMg_ {};
+    static constexpr int STATE_N = 6;
+
+    // EKF 参数需要按实测调。
+    // 这里单位分清楚：bias 状态是 mg，速度/位置是 SI 单位。
+    static constexpr double MG_TO_MPS2 = G0 / 1000.0;
+    static constexpr double EKF_ACC_NOISE_MPS2 = 0.12;       // 约 12 mg 的等效加速度噪声
+    static constexpr double EKF_BIAS_RW_MG_SQRT_S = 0.20;    // bias 随机游走，mg/sqrt(s)
+    static constexpr double EKF_ZUPT_VEL_NOISE = 0.012;      // 静止速度观测噪声，m/s
+    static constexpr double EKF_BIAS_MEAS_NOISE_MG = 3.0;    // 静止时 bias 观测噪声，mg
+
+    // path_length 统计参数。不要用逐帧位置差直接作为最终路径，会把 EKF 的微小抖动累计放大。
+    static constexpr double PATH_SPEED_LP_ALPHA = 0.18;       // 速度低通系数
+    static constexpr double PATH_SPEED_DEADBAND_MPS = 0.035;  // 低于 3.5 cm/s 当作噪声
+    static constexpr double PATH_ACC_GATE_MPS2 = 0.06;        // 加速度太小时不认为在有效运动
+    static constexpr double PATH_MAX_SPEED_MPS = 1.20;        // 防止瞬时速度尖峰污染路径
+
+    double x_[STATE_N] {};       // [px, py, vx, vy, bax_mg, bay_mg]
+    double P_[STATE_N][STATE_N] {};
 
     float pathLength_ = 0.0f;
-
+    float rawPathLength_ = 0.0f;
+    double pathSpeedLp_ = 0.0;
     int stationaryCount_ = 0;
     bool lastStationary_ = false;
+
+    bool detectStationary(
+        float linAxMg,
+        float linAyMg,
+        float gxDps,
+        float gyDps,
+        float gzDps,
+        float axRawMg,
+        float ayRawMg,
+        float azRawMg
+    ) const {
+        float accNormMg = vec3Norm(axRawMg, ayRawMg, azRawMg);
+
+        // 如果 Z 轴陀螺已做零偏校准，则静止检测应包含 gz；
+        // 如果关闭 Z 轴校准，gz 原始零偏可能很大，则不能参与静止判断。
+        float gyroNorm = 0.0f;
+        if constexpr (CALIBRATE_GYRO_Z) {
+            gyroNorm = vec3Norm(gxDps, gyDps, gzDps);
+        } else {
+            gyroNorm = std::sqrt(gxDps * gxDps + gyDps * gyDps);
+            (void)gzDps;
+        }
+
+        float linAxCorr = linAxMg - static_cast<float>(x_[4]);
+        float linAyCorr = linAyMg - static_cast<float>(x_[5]);
+        float linNormMg = std::sqrt(linAxCorr * linAxCorr + linAyCorr * linAyCorr);
+
+        return gyroNorm < STATIONARY_GYRO_DPS &&
+               std::fabs(accNormMg - 1000.0f) < STATIONARY_ACC_NORM_ERR_MG &&
+               linNormMg < STATIONARY_LIN_ACC_XY_MG;
+    }
+
+    void updateGatedPathLength(double axBodyMps2, double ayBodyMps2, float dtF) {
+        if (dtF <= 0.0f || dtF > DT_MAX) {
+            return;
+        }
+
+        double speed = std::sqrt(x_[2] * x_[2] + x_[3] * x_[3]);
+        if (speed > PATH_MAX_SPEED_MPS) {
+            speed = PATH_MAX_SPEED_MPS;
+        }
+
+        pathSpeedLp_ = (1.0 - PATH_SPEED_LP_ALPHA) * pathSpeedLp_ + PATH_SPEED_LP_ALPHA * speed;
+
+        double linAcc = std::sqrt(axBodyMps2 * axBodyMps2 + ayBodyMps2 * ayBodyMps2);
+
+        if (lastStationary_ || pathSpeedLp_ <= PATH_SPEED_DEADBAND_MPS || linAcc <= PATH_ACC_GATE_MPS2) {
+            return;
+        }
+
+        double effectiveSpeed = pathSpeedLp_ - PATH_SPEED_DEADBAND_MPS;
+        pathLength_ += static_cast<float>(effectiveSpeed * static_cast<double>(dtF));
+    }
+
+    void predict(float linAxMg, float linAyMg, float yawDeg, float dtF) {
+        double dt = static_cast<double>(dtF);
+        double dt2 = dt * dt;
+
+        double c = 1.0;
+        double s = 0.0;
+
+        if constexpr (USE_YAW_FOR_XY_ROTATION) {
+            double yawRad = static_cast<double>(yawDeg) * 0.017453292519943295;
+            c = std::cos(yawRad);
+            s = std::sin(yawRad);
+        } else {
+            (void)yawDeg;
+        }
+
+        double axBody = (static_cast<double>(linAxMg) - x_[4]) * MG_TO_MPS2;
+        double ayBody = (static_cast<double>(linAyMg) - x_[5]) * MG_TO_MPS2;
+
+        double axWorld = c * axBody - s * ayBody;
+        double ayWorld = s * axBody + c * ayBody;
+
+        x_[0] += x_[2] * dt + 0.5 * axWorld * dt2;
+        x_[1] += x_[3] * dt + 0.5 * ayWorld * dt2;
+        x_[2] += axWorld * dt;
+        x_[3] += ayWorld * dt;
+
+        double F[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            F[i][i] = 1.0;
+        }
+
+        F[0][2] = dt;
+        F[1][3] = dt;
+
+        // a_world = R * (lin - bias) * MG_TO_MPS2
+        double dax_dbx = -MG_TO_MPS2 * c;
+        double dax_dby =  MG_TO_MPS2 * s;
+        double day_dbx = -MG_TO_MPS2 * s;
+        double day_dby = -MG_TO_MPS2 * c;
+
+        F[0][4] = 0.5 * dt2 * dax_dbx;
+        F[0][5] = 0.5 * dt2 * dax_dby;
+        F[1][4] = 0.5 * dt2 * day_dbx;
+        F[1][5] = 0.5 * dt2 * day_dby;
+        F[2][4] = dt * dax_dbx;
+        F[2][5] = dt * dax_dby;
+        F[3][4] = dt * day_dbx;
+        F[3][5] = dt * day_dby;
+
+        double FP[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                for (int k = 0; k < STATE_N; ++k) {
+                    FP[i][j] += F[i][k] * P_[k][j];
+                }
+            }
+        }
+
+        double newP[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                for (int k = 0; k < STATE_N; ++k) {
+                    newP[i][j] += FP[i][k] * F[j][k];
+                }
+            }
+        }
+
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                P_[i][j] = newP[i][j];
+            }
+        }
+
+        // 加速度白噪声进入位置/速度。
+        double qa = EKF_ACC_NOISE_MPS2 * EKF_ACC_NOISE_MPS2;
+        addAccelProcessNoise(0, 2, qa, dt);
+        addAccelProcessNoise(1, 3, qa, dt);
+
+        // bias 随机游走。
+        double qb = EKF_BIAS_RW_MG_SQRT_S * EKF_BIAS_RW_MG_SQRT_S * dt;
+        P_[4][4] += qb;
+        P_[5][5] += qb;
+    }
+
+    void addAccelProcessNoise(int posIdx, int velIdx, double qa, double dt) {
+        double dt2 = dt * dt;
+        double dt3 = dt2 * dt;
+        double dt4 = dt2 * dt2;
+
+        P_[posIdx][posIdx] += 0.25 * dt4 * qa;
+        P_[posIdx][velIdx] += 0.5 * dt3 * qa;
+        P_[velIdx][posIdx] += 0.5 * dt3 * qa;
+        P_[velIdx][velIdx] += dt2 * qa;
+    }
+
+    void updateVelocityZero() {
+        double H[2][STATE_N] {};
+        H[0][2] = 1.0;
+        H[1][3] = 1.0;
+
+        double z[2] = {0.0, 0.0};
+        double r = EKF_ZUPT_VEL_NOISE * EKF_ZUPT_VEL_NOISE;
+        update2(H, z, r, r);
+    }
+
+    void updateAccelBias(float linAxMg, float linAyMg) {
+        double H[2][STATE_N] {};
+        H[0][4] = 1.0;
+        H[1][5] = 1.0;
+
+        double z[2] = {
+            static_cast<double>(linAxMg),
+            static_cast<double>(linAyMg)
+        };
+
+        double r = EKF_BIAS_MEAS_NOISE_MG * EKF_BIAS_MEAS_NOISE_MG;
+        update2(H, z, r, r);
+    }
+
+
+    void update1(const double H[STATE_N], double z, double r) {
+        double hx = 0.0;
+        for (int i = 0; i < STATE_N; ++i) {
+            hx += H[i] * x_[i];
+        }
+
+        double y = z - hx;
+
+        double S = r;
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                S += H[i] * P_[i][j] * H[j];
+            }
+        }
+
+        if (std::fabs(S) < 1e-18) {
+            return;
+        }
+
+        double PHt[STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                PHt[i] += P_[i][j] * H[j];
+            }
+        }
+
+        double K[STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            K[i] = PHt[i] / S;
+        }
+
+        for (int i = 0; i < STATE_N; ++i) {
+            x_[i] += K[i] * y;
+        }
+
+        double KH[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                KH[i][j] = K[i] * H[j];
+            }
+        }
+
+        double IminusKH[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                IminusKH[i][j] = (i == j ? 1.0 : 0.0) - KH[i][j];
+            }
+        }
+
+        double newP[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                for (int k = 0; k < STATE_N; ++k) {
+                    newP[i][j] += IminusKH[i][k] * P_[k][j];
+                }
+            }
+        }
+
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                P_[i][j] = newP[i][j];
+            }
+        }
+    }
+
+    void update2(const double H[2][STATE_N], const double z[2], double r0, double r1) {
+        double hx[2] {};
+        for (int row = 0; row < 2; ++row) {
+            for (int i = 0; i < STATE_N; ++i) {
+                hx[row] += H[row][i] * x_[i];
+            }
+        }
+
+        double y[2] = {z[0] - hx[0], z[1] - hx[1]};
+
+        double S[2][2] {};
+        for (int row = 0; row < 2; ++row) {
+            for (int col = 0; col < 2; ++col) {
+                for (int i = 0; i < STATE_N; ++i) {
+                    for (int j = 0; j < STATE_N; ++j) {
+                        S[row][col] += H[row][i] * P_[i][j] * H[col][j];
+                    }
+                }
+            }
+        }
+        S[0][0] += r0;
+        S[1][1] += r1;
+
+        double det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+        if (std::fabs(det) < 1e-18) {
+            return;
+        }
+
+        double invS[2][2] {
+            { S[1][1] / det, -S[0][1] / det },
+            { -S[1][0] / det, S[0][0] / det }
+        };
+
+        double PHt[STATE_N][2] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int row = 0; row < 2; ++row) {
+                for (int j = 0; j < STATE_N; ++j) {
+                    PHt[i][row] += P_[i][j] * H[row][j];
+                }
+            }
+        }
+
+        double K[STATE_N][2] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int col = 0; col < 2; ++col) {
+                for (int k = 0; k < 2; ++k) {
+                    K[i][col] += PHt[i][k] * invS[k][col];
+                }
+            }
+        }
+
+        for (int i = 0; i < STATE_N; ++i) {
+            x_[i] += K[i][0] * y[0] + K[i][1] * y[1];
+        }
+
+        double KH[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                KH[i][j] = K[i][0] * H[0][j] + K[i][1] * H[1][j];
+            }
+        }
+
+        double IminusKH[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                IminusKH[i][j] = (i == j ? 1.0 : 0.0) - KH[i][j];
+            }
+        }
+
+        double newP[STATE_N][STATE_N] {};
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                for (int k = 0; k < STATE_N; ++k) {
+                    newP[i][j] += IminusKH[i][k] * P_[k][j];
+                }
+            }
+        }
+
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = 0; j < STATE_N; ++j) {
+                P_[i][j] = newP[i][j];
+            }
+        }
+    }
+
+    void symmetrizeP() {
+        for (int i = 0; i < STATE_N; ++i) {
+            for (int j = i + 1; j < STATE_N; ++j) {
+                double v = 0.5 * (P_[i][j] + P_[j][i]);
+                P_[i][j] = v;
+                P_[j][i] = v;
+            }
+
+            if (P_[i][i] < 1e-12) {
+                P_[i][i] = 1e-12;
+            }
+        }
+    }
 };
 
 int main(int argc, char** argv) {
@@ -606,9 +1000,16 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        MahonyAHRS ahrs(MAHONY_KP, MAHONY_KI);
+        AttitudeEKF ahrs(
+            ATT_EKF_ACC_NOISE_UNIT,
+            ATT_EKF_GYRO_NOISE_DPS_SQRT_HZ,
+            ATT_EKF_BIAS_RW_DPS_SQRT_S
+        );
 
         G354Data gyroBias = calibrateGyroBias(ser, GYRO_CALIB_SAMPLES);
+        std::cout << "Z gyro bias correction: "
+                  << (CALIBRATE_GYRO_Z ? "enabled" : "disabled, gz free integration")
+                  << std::endl;
 
         G354Data accInit {};
         if (!averageAccelForInit(ser, ACC_INIT_SAMPLES, accInit)) {
@@ -617,7 +1018,7 @@ int main(int argc, char** argv) {
         }
 
         if (!ahrs.initFromAccel(accInit.ax, accInit.ay, accInit.az, 0.0f)) {
-            std::cerr << "Mahony initFromAccel failed." << std::endl;
+            std::cerr << "AttitudeEKF initFromAccel failed." << std::endl;
             return 1;
         }
 
@@ -630,8 +1031,8 @@ int main(int argc, char** argv) {
                   << " yaw=" << initYaw
                   << std::endl;
 
-        std::cout << "开始 AHRS warm-up: " << AHRS_WARMUP_SAMPLES
-                  << " samples。此阶段只更新姿态，不积分路径。" << std::endl;
+        std::cout << "开始 Attitude EKF warm-up: " << AHRS_WARMUP_SAMPLES
+                  << " samples。此阶段只用姿态EKF更新姿态，不积分路径。" << std::endl;
 
         auto lastT = std::chrono::steady_clock::now();
         int warmBad = 0;
@@ -657,7 +1058,7 @@ int main(int argc, char** argv) {
 
             float gxCal = imu.gx - gyroBias.gx;
             float gyCal = imu.gy - gyroBias.gy;
-            float gzCal = imu.gz - gyroBias.gz;
+            float gzCal = CALIBRATE_GYRO_Z ? (imu.gz - gyroBias.gz) : imu.gz;
 
             ahrs.updateIMU(gxCal, gyCal, gzCal, imu.ax, imu.ay, imu.az, dt);
 
@@ -679,10 +1080,11 @@ int main(int argc, char** argv) {
                   << " warm_bad=" << warmBad
                   << std::endl;
 
-        PlanarPathIntegrator path;
+        PlanarEKF path;
         path.reset();
 
-        std::cout << "进入姿态解算 + XY 重力补偿 + 路径积分循环。Ctrl+C 结束并输出最终位移。"
+        std::cout << "进入 Attitude EKF 姿态解算 + XY 重力补偿 + 路径积分循环。Ctrl+C 结束并输出最终位移。"
+                  << " USE_YAW_FOR_XY_ROTATION=" << (USE_YAW_FOR_XY_ROTATION ? 1 : 0)
                   << std::endl;
 
         lastT = std::chrono::steady_clock::now();
@@ -712,7 +1114,7 @@ int main(int argc, char** argv) {
 
             float gxCal = imu.gx - gyroBias.gx;
             float gyCal = imu.gy - gyroBias.gy;
-            float gzCal = imu.gz - gyroBias.gz;
+            float gzCal = CALIBRATE_GYRO_Z ? (imu.gz - gyroBias.gz) : imu.gz;
 
             ahrs.updateIMU(
                 gxCal, gyCal, gzCal,
@@ -739,15 +1141,15 @@ int main(int argc, char** argv) {
             float linAyMg = imu.ay + gyBody * 1000.0f;
 
             path.update(
-                linAxMg,
-                linAyMg,
+                imu.ax,
+                imu.ay,
+                imu.az,
+                gxBody,
+                gyBody,
                 yaw,
                 gxCal,
                 gyCal,
                 gzCal,
-                imu.ax,
-                imu.ay,
-                imu.az,
                 dt
             );
 
@@ -757,6 +1159,10 @@ int main(int argc, char** argv) {
                 Vec2 pos = path.position();
                 Vec2 vel = path.velocity();
                 Vec2 accBias = path.accelBiasMg();
+                Vec2 posStd = path.positionStd();
+                Vec2 velStd = path.velocityStd();
+                float attBg[3] = {0.0f, 0.0f, 0.0f};
+                ahrs.getGyroBiasDps(attBg);
 
                 float accNormG = vec3Norm(imu.ax, imu.ay, imu.az) / 1000.0f;
 
@@ -779,9 +1185,16 @@ int main(int argc, char** argv) {
                     << pos.x << "," << pos.y
                     << " | disp[m]=" << path.displacement()
                     << " path[m]=" << path.pathLength()
+                    << " rawPath[m]=" << path.rawPathLength()
                     << " | zupt=" << (path.lastStationary() ? 1 : 0)
                     << " | accBiasXY[mg]="
                     << accBias.x << "," << accBias.y
+                    << " | attBg[dps]="
+                    << attBg[0] << "," << attBg[1] << "," << attBg[2]
+                    << " | ekfStdPos[m]="
+                    << posStd.x << "," << posStd.y
+                    << " | ekfStdVel[m/s]="
+                    << velStd.x << "," << velStd.y
                     << " | dt=" << dt
                     << " | bad=" << badFrameCount
                     << std::endl;
@@ -807,7 +1220,8 @@ int main(int argc, char** argv) {
         std::cout << "final_velocity_x[m/s](最终x轴速度): " << finalVel.x << "\n";
         std::cout << "final_velocity_y[m/s](最终y轴速度): " << finalVel.y << "\n";
         std::cout << "final_displacement[m](最终位移): " << path.displacement() << "\n";
-        std::cout << "path_length[m](路径长度): " << path.pathLength() << "\n";
+        std::cout << "path_length[m](门限速度积分路径长度): " << path.pathLength() << "\n";
+        std::cout << "raw_path_length[m](原始逐帧位置差路径，仅调试): " << path.rawPathLength() << "\n";
         std::cout << "valid_frames(有效帧数): " << frameCount << "\n";
         std::cout << "bad_frames(无效帧数): " << badFrameCount << "\n";
         std::cout << "=======================================\n";
