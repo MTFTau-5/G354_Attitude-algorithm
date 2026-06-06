@@ -1,11 +1,12 @@
-#ifndef ATTITUDE_EKF_H
-#define ATTITUDE_EKF_H
+#ifndef ATTITUDE_EKF_ROLL_PITCH_H
+#define ATTITUDE_EKF_ROLL_PITCH_H
 
 #include <cmath>
 
 class AttitudeEKF {
 public:
-    // 姿态 EKF：名义状态 q + gyro residual bias，误差状态 [dtheta, dbg]。
+    // Roll/Pitch-only 姿态 EKF：名义状态仍用四元数保存 roll/pitch，yaw 被锁定为 0。
+    // 误差状态仍保留 [dtheta, dbg] 的 6 维数组形式，但 dtheta_z 和 dbg_z 被强制锁死。
     // acc_noise_unit：归一化重力方向观测噪声，0.03 约等效 30mg/约1.7deg 量级。
     // gyro_noise_dps_sqrt_hz：陀螺白噪声，用于姿态预测协方差。
     // gyro_bias_rw_dps_sqrt_s：陀螺残余零偏随机游走。
@@ -25,6 +26,7 @@ public:
 
     void getQuaternion(float q[4]) const;
     void getEuler(float& rollDeg, float& pitchDeg, float& yawDeg) const;
+    void getRollPitch(float& rollDeg, float& pitchDeg) const;
 
     float getLastAccNormG() const { return last_acc_norm_g_; }
     bool getLastAccUsed() const { return last_acc_used_; }
@@ -54,11 +56,13 @@ private:
     static void deltaQuatFromRotVec(const double rv[3], double dq[4]);
     static void gravityBodyFromQuaternion(const double q[4], double gBody[3]);
     static void skew(const double v[3], double S[3][3]);
+    static void forceYawZeroFromRollPitch(double q[4]);
 
     void predict(const double gyroRad[3], double dt);
     void updateAccelGravity(const double measuredGravityBody[3]);
     void applyErrorState(const double dx[ERR_N]);
     void symmetrizeP();
+    void lockYawAndZBias();
 };
 
 #endif

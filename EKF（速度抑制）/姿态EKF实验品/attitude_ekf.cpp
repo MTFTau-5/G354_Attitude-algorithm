@@ -1,4 +1,4 @@
-#include "attitude_ekf.h"
+#include "attitude_ekf_roll_pitch.h"
 
 #include <algorithm>
 #include <cstring>
@@ -39,15 +39,16 @@ void AttitudeEKF::resetCovariance() {
     }
 
     // 初始角度误差标准差约 5deg；残余陀螺零偏约 0.2dps。
+    // Roll/Pitch-only：dtheta_z(yaw error) 和 dbg_z 不估计，协方差锁死。
     const double angleStd = 5.0 * DEG2RAD;
     const double biasStd = 0.20 * DEG2RAD;
 
     P_[0][0] = angleStd * angleStd;
     P_[1][1] = angleStd * angleStd;
-    P_[2][2] = angleStd * angleStd;
+    P_[2][2] = 1e-14;
     P_[3][3] = biasStd * biasStd;
     P_[4][4] = biasStd * biasStd;
-    P_[5][5] = biasStd * biasStd;
+    P_[5][5] = 1e-14;
 }
 
 void AttitudeEKF::normalizeQuaternion(double q[4]) {
@@ -64,6 +65,30 @@ void AttitudeEKF::normalizeQuaternion(double q[4]) {
     q[1] *= inv;
     q[2] *= inv;
     q[3] *= inv;
+}
+
+void AttitudeEKF::forceYawZeroFromRollPitch(double q[4]) {
+    // 保留当前 roll/pitch，强制 yaw=0。
+    // 这样不再对 yaw 进行传播、观测或输出，避免六轴不可观测 yaw 污染 roll/pitch。
+    double roll = std::atan2(
+        2.0 * (q[0] * q[1] + q[2] * q[3]),
+        1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2])
+    );
+
+    double sinPitch = 2.0 * (q[0] * q[2] - q[3] * q[1]);
+    sinPitch = std::max(-1.0, std::min(1.0, sinPitch));
+    double pitch = std::asin(sinPitch);
+
+    double cr = std::cos(roll * 0.5);
+    double sr = std::sin(roll * 0.5);
+    double cp = std::cos(pitch * 0.5);
+    double sp = std::sin(pitch * 0.5);
+
+    q[0] = cp * cr;
+    q[1] = cp * sr;
+    q[2] = sp * cr;
+    q[3] = -sp * sr;
+    normalizeQuaternion(q);
 }
 
 void AttitudeEKF::quatMultiply(const double a[4], const double b[4], double out[4]) {
@@ -123,7 +148,8 @@ bool AttitudeEKF::initFromAccel(float axMg, float ayMg, float azMg, float yawDeg
 
     double roll = std::atan2(gy, gz);
     double pitch = std::atan2(-gx, std::sqrt(gy * gy + gz * gz));
-    double yaw = static_cast<double>(yawDeg) * DEG2RAD;
+    (void)yawDeg;
+    double yaw = 0.0;
 
     double cr = std::cos(roll * 0.5);
     double sr = std::sin(roll * 0.5);
@@ -137,6 +163,7 @@ bool AttitudeEKF::initFromAccel(float axMg, float ayMg, float azMg, float yawDeg
     q_[2] = sy * cp * sr + cy * sp * cr;
     q_[3] = sy * cp * cr - cy * sp * sr;
     normalizeQuaternion(q_);
+    forceYawZeroFromRollPitch(q_);
 
     bg_[0] = 0.0;
     bg_[1] = 0.0;
@@ -189,10 +216,10 @@ void AttitudeEKF::predict(const double gyroRad[3], double dt) {
     double omega[3] = {
         gyroRad[0] - bg_[0],
         gyroRad[1] - bg_[1],
-        gyroRad[2] - bg_[2]
+        0.0
     };
 
-    double rv[3] = {omega[0] * dt, omega[1] * dt, omega[2] * dt};
+    double rv[3] = {omega[0] * dt, omega[1] * dt, 0.0};
     double dq[4];
     deltaQuatFromRotVec(rv, dq);
 
@@ -200,6 +227,7 @@ void AttitudeEKF::predict(const double gyroRad[3], double dt) {
     quatMultiply(q_, dq, qNew);
     std::memcpy(q_, qNew, sizeof(qNew));
     normalizeQuaternion(q_);
+    forceYawZeroFromRollPitch(q_);
 
     double F[ERR_N][ERR_N] {};
     for (int i = 0; i < ERR_N; ++i) {
@@ -214,6 +242,16 @@ void AttitudeEKF::predict(const double gyroRad[3], double dt) {
         }
         F[r][r + 3] = -dt;
     }
+
+    // Roll/Pitch-only：不传播 yaw 误差，不估计 z 轴残余零偏。
+    for (int i = 0; i < ERR_N; ++i) {
+        F[2][i] = 0.0;
+        F[i][2] = 0.0;
+        F[5][i] = 0.0;
+        F[i][5] = 0.0;
+    }
+    F[2][2] = 1.0;
+    F[5][5] = 1.0;
 
     double FP[ERR_N][ERR_N] {};
     for (int i = 0; i < ERR_N; ++i) {
@@ -244,10 +282,11 @@ void AttitudeEKF::predict(const double gyroRad[3], double dt) {
 
     P_[0][0] += qg;
     P_[1][1] += qg;
-    P_[2][2] += qg;
+    P_[2][2] = 1e-14;
     P_[3][3] += qbg;
     P_[4][4] += qbg;
-    P_[5][5] += qbg;
+    P_[5][5] = 1e-14;
+    lockYawAndZBias();
 }
 
 void AttitudeEKF::updateAccelGravity(const double measuredGravityBody[3]) {
@@ -351,6 +390,10 @@ void AttitudeEKF::updateAccelGravity(const double measuredGravityBody[3]) {
         }
     }
 
+    // 六轴下 yaw 不可观测：禁止加速度更新修正 yaw 和 z 轴 gyro bias。
+    dx[2] = 0.0;
+    dx[5] = 0.0;
+
     applyErrorState(dx);
 
     double KH[ERR_N][ERR_N] {};
@@ -383,10 +426,11 @@ void AttitudeEKF::updateAccelGravity(const double measuredGravityBody[3]) {
             P_[i][j] = newP[i][j];
         }
     }
+    lockYawAndZBias();
 }
 
 void AttitudeEKF::applyErrorState(const double dx[ERR_N]) {
-    double rv[3] = {dx[0], dx[1], dx[2]};
+    double rv[3] = {dx[0], dx[1], 0.0};
     double dq[4];
     deltaQuatFromRotVec(rv, dq);
 
@@ -394,10 +438,11 @@ void AttitudeEKF::applyErrorState(const double dx[ERR_N]) {
     quatMultiply(q_, dq, qNew);
     std::memcpy(q_, qNew, sizeof(qNew));
     normalizeQuaternion(q_);
+    forceYawZeroFromRollPitch(q_);
 
     bg_[0] += dx[3];
     bg_[1] += dx[4];
-    bg_[2] += dx[5];
+    bg_[2] = 0.0;
 }
 
 void AttitudeEKF::symmetrizeP() {
@@ -411,6 +456,20 @@ void AttitudeEKF::symmetrizeP() {
             P_[i][i] = 1e-14;
         }
     }
+    lockYawAndZBias();
+}
+
+void AttitudeEKF::lockYawAndZBias() {
+    for (int i = 0; i < ERR_N; ++i) {
+        P_[2][i] = 0.0;
+        P_[i][2] = 0.0;
+        P_[5][i] = 0.0;
+        P_[i][5] = 0.0;
+    }
+    P_[2][2] = 1e-14;
+    P_[5][5] = 1e-14;
+    bg_[2] = 0.0;
+    forceYawZeroFromRollPitch(q_);
 }
 
 void AttitudeEKF::getQuaternion(float q[4]) const {
@@ -430,18 +489,18 @@ void AttitudeEKF::getEuler(float& rollDeg, float& pitchDeg, float& yawDeg) const
     sinPitch = std::max(-1.0, std::min(1.0, sinPitch));
     double pitch = std::asin(sinPitch);
 
-    double yaw = std::atan2(
-        2.0 * (q_[1] * q_[2] + q_[0] * q_[3]),
-        1.0 - 2.0 * (q_[2] * q_[2] + q_[3] * q_[3])
-    );
-
     rollDeg = static_cast<float>(roll * RAD2DEG);
     pitchDeg = static_cast<float>(pitch * RAD2DEG);
-    yawDeg = static_cast<float>(yaw * RAD2DEG);
+    yawDeg = 0.0f;
+}
+
+void AttitudeEKF::getRollPitch(float& rollDeg, float& pitchDeg) const {
+    float yawIgnored = 0.0f;
+    getEuler(rollDeg, pitchDeg, yawIgnored);
 }
 
 void AttitudeEKF::getGyroBiasDps(float bias[3]) const {
     bias[0] = static_cast<float>(bg_[0] * RAD2DEG);
     bias[1] = static_cast<float>(bg_[1] * RAD2DEG);
-    bias[2] = static_cast<float>(bg_[2] * RAD2DEG);
+    bias[2] = 0.0f;
 }
