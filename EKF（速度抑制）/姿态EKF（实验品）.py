@@ -375,7 +375,7 @@ class AttitudeEKF:
         self.P[2, 2] += qg
         self.P[3, 3] += qbg
         self.P[4, 4] += qbg
-        self.P[5, 5] += qbg
+        self.P[5, 5] = 1e-14
 
     def update_accel_gravity(self, measured_gravity_body: np.ndarray) -> None:
         h = self.gravity_body_from_quaternion(self.q)
@@ -411,7 +411,9 @@ class AttitudeEKF:
         dq = self.delta_quat_from_rot_vec(rv)
         self.q = self.quat_multiply(self.q, dq)
         self.q = self.normalize_quaternion(self.q)
-        self.bg += dx[3:6]
+        self.bg[0] += dx[3]
+        self.bg[1] += dx[4]
+        self.bg[2] = 0.0
 
     def symmetrize_p(self) -> None:
         self.P = 0.5 * (self.P + self.P.T)
