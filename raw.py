@@ -39,7 +39,117 @@ WARMUP_SAMPLES = 300
 DT_MIN = 0.001
 DT_MAX = 0.05
 G354_FRAME_LEN = 38
+G354_ADDR_WIN_CTRL        = 0x7E
+G354_ADDR_MODE_CTRL_HI    = 0x03
+G354_ADDR_UART_CTRL_LO    = 0x08
+G354_ADDR_BURST_CTRL1_LO  = 0x0C
+G354_ADDR_BURST_CTRL2_LO  = 0x0E
 
+G354_CMD_WINDOW0          = 0x00
+G354_CMD_WINDOW1          = 0x01
+G354_CMD_BEGIN_SAMPLING   = 0x01
+G354_CMD_END_SAMPLING     = 0x02
+
+G354_BURST_CTRL1_FIXED    = 0xF007
+G354_BURST_CTRL2_FIXED    = 0x7000
+
+
+def write_g354_reg8(ser, addr, value):
+    cmd = bytes([
+        0x80 | (addr & 0x7F),
+        value & 0xFF,
+        0x0D
+    ])
+    ser.write(cmd)
+    ser.flush()
+    time.sleep(0.002)
+
+
+def write_g354_reg16_parts(ser, addr_lo, value):
+    write_g354_reg8(ser, addr_lo, value & 0xFF)
+    write_g354_reg8(ser, addr_lo + 1, (value >> 8) & 0xFF)
+
+
+def read_exact(ser, n, timeout=0.2):
+    old_timeout = ser.timeout
+    ser.timeout = timeout
+    data = bytearray()
+
+    deadline = time.monotonic() + timeout
+    while len(data) < n and time.monotonic() < deadline:
+        chunk = ser.read(n - len(data))
+        if chunk:
+            data.extend(chunk)
+
+    ser.timeout = old_timeout
+    return bytes(data)
+
+
+def read_g354_reg16(ser, addr_even):
+    ser.reset_input_buffer()
+
+    cmd = bytes([
+        addr_even & 0x7E,
+        0x00,
+        0x0D
+    ])
+    ser.write(cmd)
+    ser.flush()
+
+    resp = read_exact(ser, 4, timeout=0.2)
+
+    if len(resp) != 4:
+        raise RuntimeError(f"read reg 0x{addr_even:02X} failed: got {len(resp)} bytes")
+
+    if resp[0] != (addr_even & 0x7E) or resp[3] != 0x0D:
+        raise RuntimeError(
+            f"read reg 0x{addr_even:02X} bad resp: "
+            f"{resp.hex(' ')}"
+        )
+
+    return (resp[1] << 8) | resp[2]
+
+
+def init_g354_sampling_mode(ser):
+    print("Configuring G354 fixed UART burst format: "
+          "BURST_CTRL1=0xF007, BURST_CTRL2=0x7000, frame_len=38")
+
+    write_g354_reg8(ser, G354_ADDR_WIN_CTRL, G354_CMD_WINDOW0)
+    write_g354_reg8(ser, G354_ADDR_MODE_CTRL_HI, G354_CMD_END_SAMPLING)
+
+    time.sleep(0.2)
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    write_g354_reg8(ser, G354_ADDR_WIN_CTRL, G354_CMD_WINDOW1)
+    write_g354_reg8(ser, G354_ADDR_UART_CTRL_LO, 0x00)
+    write_g354_reg16_parts(
+        ser,
+        G354_ADDR_BURST_CTRL1_LO,
+        G354_BURST_CTRL1_FIXED
+    )
+    write_g354_reg16_parts(
+        ser,
+        G354_ADDR_BURST_CTRL2_LO,
+        G354_BURST_CTRL2_FIXED
+    )
+
+    burst1 = read_g354_reg16(ser, G354_ADDR_BURST_CTRL1_LO)
+    burst2 = read_g354_reg16(ser, G354_ADDR_BURST_CTRL2_LO)
+
+    print(f"readback BURST_CTRL1=0x{burst1:04X}, BURST_CTRL2=0x{burst2:04X}")
+
+    if burst1 != G354_BURST_CTRL1_FIXED or burst2 != G354_BURST_CTRL2_FIXED:
+        raise RuntimeError(
+            f"G354 burst register mismatch: "
+            f"BURST_CTRL1=0x{burst1:04X}, BURST_CTRL2=0x{burst2:04X}"
+        )
+
+    write_g354_reg8(ser, G354_ADDR_WIN_CTRL, G354_CMD_WINDOW0)
+    write_g354_reg8(ser, G354_ADDR_MODE_CTRL_HI, G354_CMD_BEGIN_SAMPLING)
+
+    time.sleep(0.1)
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
 
 class MahonyAHRS:
     """
@@ -47,7 +157,7 @@ class MahonyAHRS:
 
     注意：
     1. 6轴只能用重力约束 roll/pitch，无法从根本上约束 yaw。
-    2. 本代码把四元数 q=[1,0,0,0] 定义为：真实重力方向在机体系下为 +Z。
+    2. 本代码把四元数 q=[1,0,0,0] 定义为：真实重力方向在机体系下为 +Z，我是傻逼第一次写反了，最后发现偏航很严重才改的。
     3. G354 原始加速度静止时约为 -Z，因此 update_imu 内部会取反。
     """
 
@@ -234,7 +344,7 @@ def calibrate_gyro_bias(ser, samples=500):
 
 
 def average_accel_for_init(ser, samples=200):
-    print(f"开始加速度姿态初始化：{samples} samples。请保持 IMU 静止。")
+    print(f"开始加速度姿态初始化：{samples} samples。请保持 IMU 静止。不要动他口牙。")
 
     acc_sum = np.zeros(3, dtype=float)
     valid = 0
@@ -260,16 +370,12 @@ def average_accel_for_init(ser, samples=200):
 
 def main():
     ser = serial.Serial(PORT, BAUDRATE, timeout=0.2)
-    time.sleep(0.2)
+    time.sleep(0.8)  
     ser.reset_input_buffer()
     ser.reset_output_buffer()
-
-    # 兼容你原来的简化配置命令。
-    # C++ 版 main_fixed.cpp 里有更完整的寄存器配置与回读校验。
-    ser.write(bytes([0xFE, 0x00, 0x0D, 0x83, 0x01, 0x0D]))
-    time.sleep(0.1)
-    ser.reset_input_buffer()
-
+    
+    init_g354_sampling_mode(ser)
+        
     mahony = MahonyAHRS(
         kp=MAHONY_KP,
         ki=MAHONY_KI,
@@ -284,7 +390,7 @@ def main():
     roll, pitch, yaw = mahony.get_euler()
     print(f"初始姿态 roll:{roll:.2f} pitch:{pitch:.2f} yaw:{yaw:.2f}")
 
-    print(f"开始 AHRS warm-up：{WARMUP_SAMPLES} samples，只更新姿态，不做路径积分。")
+    print(f"开始 AHRS warm-up：{WARMUP_SAMPLES} samples，只更新姿态。")
     last_t = time.perf_counter()
     for _ in range(WARMUP_SAMPLES):
         try:
