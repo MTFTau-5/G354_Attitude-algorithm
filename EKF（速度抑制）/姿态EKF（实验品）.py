@@ -645,4 +645,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n你要跟可丽玩吗？嗒嗒嗒嗒嗒，好想玩原神（云原神！）")
+        print("\n你要跟可莉玩吗？嗒嗒嗒嗒嗒，好想玩原神（云原神！）")
